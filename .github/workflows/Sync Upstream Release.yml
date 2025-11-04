@@ -9,9 +9,9 @@ concurrency:
   group: sync-upstream-releases
   cancel-in-progress: false
 
-# 关键：显式设置权限
+# 显式设置权限
 permissions:
-  contents: write    # 创建 releases 和上传 assets 需要
+  contents: write
   actions: read
   checks: read
 
@@ -31,6 +31,18 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq curl
 
+      - name: Debug - Check permissions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== 检查 GITHUB_TOKEN 权限 ==="
+          response=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}")
+          echo "仓库权限信息:"
+          echo "$response" | jq '.permissions'
+          echo "令牌权限范围:"
+          curl -s -H "Authorization: token $GH_TOKEN" https://api.github.com/user | jq '.'
+
       - name: Sync upstream releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -41,8 +53,202 @@ jobs:
           UPSTREAM="${UPSTREAM_OWNER}/${UPSTREAM_REPO}"
           echo "=== 开始从 $UPSTREAM 同步到 ${GITHUB_REPOSITORY} ==="
 
-          # 检查上游仓库
+          # 首先检查上游仓库是否存在且有 releases
           echo "检查上游仓库状态..."
           upstream_info=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
             "https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}")
-          # ... 其余代码保持不变
+          
+          upstream_status=$(echo "$upstream_info" | tail -n1)
+          upstream_content=$(echo "$upstream_info" | head -n -1)
+          
+          if [ "$upstream_status" -ne 200 ]; then
+            echo "错误: 无法访问上游仓库 $UPSTREAM (HTTP $upstream_status)"
+            echo "响应: $upstream_content"
+            exit 1
+          fi
+
+          upstream_name=$(echo "$upstream_content" | jq -r '.full_name')
+          releases_count=$(echo "$upstream_content" | jq -r '.releases_count // 0')
+          echo "✓ 上游仓库: $upstream_name"
+          echo "✓ 发布数量: $releases_count"
+
+          mkdir -p upstream-assets
+
+          page=1
+          total_processed=0
+          total_created=0
+          total_skipped=0
+
+          while true; do
+            echo "=== 获取第 $page 页 releases ==="
+            response=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/releases?per_page=${PER_PAGE}&page=${page}")
+            
+            status_code=$(echo "$response" | tail -n1)
+            releases_content=$(echo "$response" | head -n -1)
+            
+            if [ "$status_code" -ne 200 ]; then
+              echo "错误: 获取 releases 失败 (HTTP $status_code)"
+              echo "响应: $releases_content"
+              exit 1
+            fi
+
+            # 检查是否为空数组或无效响应
+            if ! echo "$releases_content" | jq -e '. | type == "array"' > /dev/null; then
+              echo "错误: 无效的 API 响应"
+              echo "$releases_content"
+              exit 1
+            fi
+
+            count=$(echo "$releases_content" | jq 'length')
+            echo "第 $page 页有 $count 个 releases"
+
+            if [ "$count" -eq 0 ]; then
+              echo "=== 所有页面处理完成 ==="
+              echo "总计处理: $total_processed 个 releases"
+              echo "总计创建: $total_created 个新 releases"
+              echo "总计跳过: $total_skipped 个已存在的 releases"
+              break
+            fi
+
+            # 使用临时文件处理，避免子shell变量问题
+            temp_file=$(mktemp)
+            echo "$releases_content" | jq -c '.[]' > "$temp_file"
+            
+            while IFS= read -r rel; do
+              [ -z "$rel" ] && continue
+              
+              total_processed=$((total_processed + 1))
+              tag_name=$(echo "$rel" | jq -r '.tag_name')
+              
+              if [ -z "$tag_name" ] || [ "$tag_name" = "null" ]; then
+                echo "跳过空 tag 的 release"
+                continue
+              fi
+
+              release_name=$(echo "$rel" | jq -r '.name // ""')
+              release_body=$(echo "$rel" | jq -r '.body // ""')
+              draft=$(echo "$rel" | jq -r '.draft')
+              prerelease=$(echo "$rel" | jq -r '.prerelease')
+              published_at=$(echo "$rel" | jq -r '.published_at')
+
+              echo "--- 处理 release: $tag_name ($release_name) ---"
+              echo "发布时间: $published_at"
+              echo "草稿: $draft, 预发布: $prerelease"
+
+              # 检查是否已存在
+              existing_check=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag_name}")
+              
+              existing_status=$(echo "$existing_check" | tail -n1)
+              existing_content=$(echo "$existing_check" | head -n -1)
+
+              if [ "$existing_status" -eq 200 ]; then
+                echo "✓ Release $tag_name 已存在，跳过"
+                total_skipped=$((total_skipped + 1))
+                continue
+              elif [ "$existing_status" -ne 404 ]; then
+                echo "? 检查 $tag_name 时出现意外状态: $existing_status"
+                echo "$existing_content"
+              fi
+
+              echo "↓ 下载 $tag_name 的 assets..."
+              safe_dir="upstream-assets/$(echo "$tag_name" | sed 's/[^A-Za-z0-9._-]/_/g')"
+              mkdir -p "$safe_dir"
+              
+              asset_urls=$(echo "$rel" | jq -r '.assets[]?.browser_download_url // empty')
+              asset_count=0
+              
+              if [ -n "$asset_urls" ]; then
+                echo "$asset_urls" | while read -r asset_url; do
+                  if [ -n "$asset_url" ]; then
+                    asset_count=$((asset_count + 1))
+                    fname=$(basename "$asset_url")
+                    echo "  下载 [$asset_count]: $fname"
+                    if curl -sL -H "Authorization: token $GH_TOKEN" -f "$asset_url" -o "${safe_dir}/${fname}"; then
+                      echo "  ✓ 下载成功: $fname"
+                    else
+                      echo "  ✗ 下载失败: $fname"
+                    fi
+                  fi
+                done
+              else
+                echo "  没有 assets 需要下载"
+              fi
+
+              echo "创建 release $tag_name..."
+              # 构造 payload
+              payload=$(jq -nc --arg tag "$tag_name" \
+                --arg name "$release_name" \
+                --arg body "$release_body" \
+                --argjson draft "$draft" \
+                --argjson prerelease "$prerelease" \
+                '{tag_name: $tag, name: $name, body: $body, draft: $draft, prerelease: $prerelease}')
+
+              echo "Payload: $payload"
+
+              create_response=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                -H "Content-Type: application/json" \
+                -d "$payload" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases")
+              
+              create_status=$(echo "$create_response" | tail -n1)
+              create_content=$(echo "$create_response" | head -n -1)
+
+              if [ "$create_status" -eq 201 ]; then
+                total_created=$((total_created + 1))
+                echo "✓ Release $tag_name 创建成功"
+                
+                upload_url=$(echo "$create_content" | jq -r '.upload_url // ""')
+                if [ -n "$upload_url" ] && [ "$upload_url" != "null" ]; then
+                  echo "↑ 上传 assets..."
+                  upload_endpoint_base="${upload_url%\{*\}"
+                  
+                  if [ -d "$safe_dir" ] && [ "$(ls -A "$safe_dir" 2>/dev/null)" ]; then
+                    for f in "${safe_dir}"/*; do
+                      [ -f "$f" ] || continue
+                      fname=$(basename "$f")
+                      echo "  上传: $fname"
+                      upload_result=$(curl -s -w "%{http_code}" -H "Authorization: token $GH_TOKEN" \
+                        -H "Content-Type: application/octet-stream" \
+                        --data-binary @"$f" \
+                        "${upload_endpoint_base}?name=${fname}")
+                      
+                      upload_status=$(echo "$upload_result" | tail -n1)
+                      upload_content=$(echo "$upload_result" | head -n -1)
+                      
+                      if [ "$upload_status" -eq 201 ]; then
+                        echo "  ✓ $fname 上传成功"
+                      else
+                        echo "  ✗ $fname 上传失败 (HTTP $upload_status)"
+                        echo "  $upload_content"
+                      fi
+                    done
+                  else
+                    echo "  ! 没有 assets 需要上传"
+                  fi
+                fi
+              else
+                echo "✗ 创建 release $tag_name 失败 (HTTP $create_status)"
+                echo "错误信息: $create_content"
+                # 继续处理下一个，不退出
+              fi
+
+              echo "--- $tag_name 处理完成 ---"
+              echo ""
+
+            done < "$temp_file"
+            
+            rm -f "$temp_file"
+            page=$((page + 1))
+          done
+
+          echo "=== 同步完成 ==="
+          echo "📊 统计信息:"
+          echo "   处理了: $total_processed 个 releases"
+          echo "   创建了: $total_created 个新 releases"
+          echo "   跳过了: $total_skipped 个已存在的 releases"
+          
+          # 清理临时文件
+          rm -rf upstream-assets
